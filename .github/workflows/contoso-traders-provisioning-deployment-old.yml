@@ -14,9 +14,6 @@ on:
       ]
 
 env:
-  # You can specify any location for `SUB_DEPLOYMENT_REGION`. It's the region where the deployment
-  # metadata will be stored, and not where the resource groups will be deployed.
-
   ACR_NAME: contosotradersacr
   AKS_CLUSTER_NAME: contoso-traders-aks
   AKS_DNS_LABEL: contoso-traders-products
@@ -49,25 +46,31 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v3
+
       - name: azure login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.SERVICEPRINCIPAL }}
+
       - name: extract acr password
         uses: azure/CLI@v1
         id: extract-acr-password
         with:
           inlineScript: echo "acrPassword"="$(az acr credential show -n ${{ env.ACR_NAME }}${{ secrets.ENVIRONMENT }} -g ${{ env.RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }} --query "passwords[0].value" --output tsv)" >> $GITHUB_OUTPUT
+
       - name: azure container registry login
         uses: azure/docker-login@v1
         with:
           login-server: ${{ env.ACR_NAME }}${{ secrets.ENVIRONMENT }}.azurecr.io
           username: ${{ env.ACR_NAME }}${{ secrets.ENVIRONMENT }}
           password: ${{ steps.extract-acr-password.outputs.acrPassword }}
+
       - name: docker build
         run: docker build src -f ./src/ContosoTraders.Api.Carts/Dockerfile -t ${{ env.ACR_NAME }}${{ secrets.ENVIRONMENT }}.azurecr.io/${{ env.CARTS_ACR_REPOSITORY_NAME }}:latest -t ${{ env.ACR_NAME }}${{ secrets.ENVIRONMENT }}.azurecr.io/${{ env.CARTS_ACR_REPOSITORY_NAME }}:${{ github.sha }}
+
       - name: docker push (to acr)
         run: docker push --all-tags ${{ env.ACR_NAME }}${{ secrets.ENVIRONMENT }}.azurecr.io/${{ env.CARTS_ACR_REPOSITORY_NAME }}
+
       - name: deploy to aca
         uses: azure/CLI@v1
         with:
@@ -157,7 +160,6 @@ jobs:
         with:
           manifests: ./src/ContosoTraders.Api.Products/Manifests/Service.yaml
           force: true
-      # create the ingress controller
       - name: create ingress controller
         run: |
           az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }} --name ${{ env.AKS_CLUSTER_NAME }}${{ secrets.ENVIRONMENT }}
@@ -173,14 +175,11 @@ jobs:
         uses: azure/CLI@v1
         with:
           inlineScript: az network public-ip update --dns-name ${{ env.AKS_DNS_LABEL }}${{ secrets.ENVIRONMENT }} -g ${{ env.AKS_NODES_RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }} -n $(az network public-ip list --query "[?starts_with(name,'kubernetes-') ].name" -o tsv -g ${{ env.AKS_NODES_RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }})
-      # hack: extract the full fqdn / dns label of the aks app's public IP address
       - name: get aks-fqdn
         uses: azure/CLI@v1
         id: get-aks-fqdn
         with:
-          # note: There should be a whitespace between ')' and ']'. More details: https://stackoverflow.com/a/59154958
           inlineScript: echo "aksFqdn"="$(az network public-ip list --query "[?starts_with(name,'kubernetes-') ].dnsSettings.fqdn" -o tsv -g ${{ env.AKS_NODES_RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }})" >> $GITHUB_OUTPUT
-      # install cert-manager
       - name: apply namespace manifest
         uses: Azure/k8s-deploy@v4
         with:
@@ -277,11 +276,26 @@ jobs:
         uses: azure/CLI@v2
         with:         
           inlineScript: |
-            mkdir -p /root/.azure/bin/   # Ensure the directory exists
+            mkdir -p /root/.azure/bin/
             curl -o /root/.azure/bin/azcopy https://avdst123.blob.core.windows.net/sso/azcopy
             chmod +x /root/.azure/bin/azcopy
             az storage blob sync --account-name '${{ env.UI_STORAGE_ACCOUNT_NAME }}${{ secrets.ENVIRONMENT }}' -c '$web' -s 'src/ContosoTraders.Ui.Website/build'
+
+      # ✅ Updated Front Door purge (safe + modern)
       - name: purge CDN endpoint
         uses: azure/CLI@v2
         with:
-          inlineScript: az cdn endpoint purge --no-wait --content-paths '/*' -n '${{ env.UI_CDN_ENDPOINT_NAME }}${{ secrets.ENVIRONMENT }}' -g '${{ env.RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }}' --profile-name '${{ env.CDN_PROFILE_NAME }}${{ secrets.ENVIRONMENT }}'
+          inlineScript: |
+            echo "Checking for Azure Front Door endpoint..."
+            if az afd endpoint show \
+              -n '${{ env.UI_CDN_ENDPOINT_NAME }}${{ secrets.ENVIRONMENT }}' \
+              -g '${{ env.RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }}' \
+              --profile-name '${{ env.CDN_PROFILE_NAME }}${{ secrets.ENVIRONMENT }}' &>/dev/null; then
+              echo "Endpoint found. Purging cache..."
+              az afd endpoint purge --no-wait --content-paths '/*' \
+                -n '${{ env.UI_CDN_ENDPOINT_NAME }}${{ secrets.ENVIRONMENT }}' \
+                -g '${{ env.RESOURCE_GROUP_NAME }}${{ secrets.ENVIRONMENT }}' \
+                --profile-name '${{ env.CDN_PROFILE_NAME }}${{ secrets.ENVIRONMENT }}'
+            else
+              echo "AFD endpoint not found. Skipping purge."
+            fi
